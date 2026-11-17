@@ -53,6 +53,7 @@ Use these terms precisely. In particular, do not use workspace, allowed root, ch
 ├── examples/       # example agent profiles
 ├── install/        # install.sh / install.ps1 bootstrap scripts
 ├── tools/oxlint/   # project lint rules
+├── apps/macos/     # DevSpace.app menu bar app (SwiftPM); bundles Node + packed DevSpace, not in the npm package
 ├── website/        # standalone docs/landing site; its own npm package, not part of the server build
 └── dist/           # build output (gitignored)
 ```
@@ -147,6 +148,7 @@ pnpm test:package-install   # packs, installs, and runs the launchers; slower
 - `pnpm qa` replays scripted MCP calls against an isolated server and renders widgets in a local MCP Apps host (needs `agent-browser`); inspect the screenshots it produces.
 - `pnpm qa:agents` replays subagent provider conformance against the built CLI; run `pnpm build` first. `--live` and `--record` use real providers.
 - `website/` builds separately: `cd website && npm ci && npm run build`.
+- `apps/macos/` (macOS only): `cd apps/macos && swift test`; `apps/macos/scripts/build-app.sh` builds and signs DevSpace.app. See `DEVELOPMENT.md`.
 - A tool's MCP shape can be checked in-process with the SDK's `InMemoryTransport` and `Client` before testing with a real host.
 
 ## Security boundaries

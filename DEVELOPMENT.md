@@ -138,6 +138,38 @@ See [website/README.md](website/README.md). If `blume dev` is already running,
 the normal build refuses to run; use `npx blume build --isolated` for output in
 `.blume-verify/dist`.
 
+## Build the macOS app
+
+`apps/macos/` is a SwiftPM menu bar app (DevSpace.app) that runs a bundled Node
+and a bundled, packed DevSpace, so it needs no global installation. It keeps
+using `~/.devspace` and `~/.local/share/devspace`. It is Apple Silicon only and
+is not part of the npm package. Building needs Xcode (Swift 6) and pnpm:
+
+```bash
+apps/macos/scripts/build-app.sh            # writes apps/macos/build/DevSpace.app
+cd apps/macos && swift test                # unit tests for the Swift code
+```
+
+The script downloads the pinned Node release and checks its SHA-256, runs
+`pnpm build` and `npm pack`, installs production dependencies with the bundled
+Node, builds the Swift binary, and signs every Mach-O file and then the bundle.
+To update Node, change `NODE_VERSION` and `NODE_SHA256` together.
+
+Signing uses `DEVSPACE_CODESIGN_IDENTITY`, or the first `Apple Development`
+identity. Sign every build with the same identity: macOS ties Screen Recording
+permission and the login item to the signature. The build is for the signing
+developer's own Mac; distributing it needs a Developer ID certificate, the
+hardened runtime, and notarization.
+
+To install, quit DevSpace, then run
+`ditto apps/macos/build/DevSpace.app /Applications/DevSpace.app` and open it.
+The app reads the login shell's environment before it starts `devspace serve`,
+so subagent CLIs on the user's PATH are found. It refuses to start a second
+server when another DevSpace already answers on the configured port. Server
+output goes to `~/Library/Logs/DevSpace/server.log`. The menu's command-line
+tool item installs `/usr/local/bin/devspace`, a wrapper that runs the bundled
+DevSpace; a global npm `devspace` earlier on PATH shadows it.
+
 ## Publish a release
 
 Use the manual **Release** GitHub Actions workflow, dispatched from `main` at a

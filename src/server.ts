@@ -27,6 +27,7 @@ import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
+import { isScreenCaptureSupportedPlatform, registerScreenCaptureTool } from "./screen-capture.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
@@ -924,6 +925,10 @@ function registerMcpSurface(
       };
     },
   );
+
+  if (isScreenCaptureSupportedPlatform()) {
+    registerScreenCaptureTool(registrationTarget, config);
+  }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
     registerArtifactTools(registrationTarget, {

@@ -192,3 +192,88 @@ export function arrowBetween(start: WhiteboardBox, end: WhiteboardBox): ArrowPla
 
   return { x, y, points: [[0, 0], [ux * span, uy * span]] };
 }
+
+/**
+ * Screen space, in CSS pixels, that Excalidraw's toolbars cover at each edge
+ * of the small whiteboard window, measured on DevSpace.app's window: the
+ * tool bar at the top, the library and lock buttons at the right, and the
+ * bottom bar.
+ */
+export const TOOLBAR_INSETS = { top: 64, right: 44, bottom: 72, left: 12 } as const;
+
+export interface ViewInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/** Excalidraw's viewport: a board point p shows at screen (p + scroll) * zoom. */
+export interface CanvasViewport {
+  width: number;
+  height: number;
+  zoom: number;
+  scrollX: number;
+  scrollY: number;
+}
+
+export interface BoardPoint {
+  x: number;
+  y: number;
+}
+
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 30;
+const FIT_PADDING_PX = 12;
+
+export function clampZoom(zoom: number): number {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom));
+}
+
+/** The board area the user can see between the toolbars. */
+export function visibleArea(view: CanvasViewport, insets: ViewInsets = TOOLBAR_INSETS): WhiteboardBox {
+  return {
+    x: insets.left / view.zoom - view.scrollX,
+    y: insets.top / view.zoom - view.scrollY,
+    width: Math.max(1, view.width - insets.left - insets.right) / view.zoom,
+    height: Math.max(1, view.height - insets.top - insets.bottom) / view.zoom,
+  };
+}
+
+/** Scroll and zoom that put `center` in the middle of the area between the toolbars. */
+export function centeredView(
+  center: BoardPoint,
+  zoom: number,
+  view: CanvasViewport,
+  insets: ViewInsets = TOOLBAR_INSETS,
+): CanvasViewport {
+  const value = clampZoom(zoom);
+  const screenX = insets.left + Math.max(1, view.width - insets.left - insets.right) / 2;
+  const screenY = insets.top + Math.max(1, view.height - insets.top - insets.bottom) / 2;
+
+  return { ...view, zoom: value, scrollX: screenX / value - center.x, scrollY: screenY / value - center.y };
+}
+
+/** The largest zoom, up to `maxZoom`, at which `box` fits between the toolbars with some padding. */
+export function fittingZoom(
+  box: WhiteboardBox,
+  view: CanvasViewport,
+  maxZoom: number,
+  insets: ViewInsets = TOOLBAR_INSETS,
+): number {
+  const width = Math.max(1, view.width - insets.left - insets.right - 2 * FIT_PADDING_PX);
+  const height = Math.max(1, view.height - insets.top - insets.bottom - 2 * FIT_PADDING_PX);
+
+  return clampZoom(Math.min(maxZoom, width / Math.max(box.width, 1), height / Math.max(box.height, 1)));
+}
+
+export function boxCenter(box: WhiteboardBox): BoardPoint {
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+export function containsBox(outer: WhiteboardBox, inner: WhiteboardBox): boolean {
+  return inner.x >= outer.x
+    && inner.y >= outer.y
+    && inner.x + inner.width <= outer.x + outer.width
+    && inner.y + inner.height <= outer.y + outer.height;
+}

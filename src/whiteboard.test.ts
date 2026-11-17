@@ -11,7 +11,11 @@ import { registerWhiteboardTools, WHITEBOARD_TOOL_NAMES, WhiteboardManager } fro
 import {
   arrowBetween,
   AUTHOR_STROKE_COLORS,
+  boxCenter,
+  centeredView,
+  fittingZoom,
   summarizeScene,
+  visibleArea,
   userEditPatches,
   type WhiteboardElement,
 } from "./whiteboard-scene.js";
@@ -78,6 +82,21 @@ test("arrows run from edge to edge between boxes", () => {
   const placement = arrowBetween({ x: 0, y: 0, width: 100, height: 40 }, { x: 300, y: 0, width: 50, height: 40 });
 
   assert.deepEqual(placement, { x: 108, y: 20, points: [[0, 0], [184, 0]] });
+});
+
+test("the visible area excludes the toolbars and follows Excalidraw's scroll and zoom", () => {
+  const view = { width: 800, height: 600, zoom: 2, scrollX: -100, scrollY: 50 };
+
+  // Insets are 12 left, 64 top, 44 right, 72 bottom screen pixels.
+  assert.deepEqual(visibleArea(view), { x: 106, y: -18, width: 372, height: 232 });
+
+  const centered = centeredView({ x: 500, y: 300 }, 0.5, view);
+
+  assert.equal(centered.zoom, 0.5);
+  assert.deepEqual(boxCenter(visibleArea(centered)), { x: 500, y: 300 });
+  // A wide box is limited by the width left between the toolbars, minus padding.
+  assert.equal(fittingZoom({ x: 0, y: 0, width: 1000, height: 100 }, view, 1), 0.72);
+  assert.equal(fittingZoom({ x: 0, y: 0, width: 10, height: 10 }, view, 1.5), 1.5);
 });
 
 interface EventReader {

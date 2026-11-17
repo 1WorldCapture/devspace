@@ -185,9 +185,9 @@ final class DesktopEventTests: XCTestCase {
     }
 
     @MainActor
-    func testDefaultWhiteboardFrameIsAnEighthOfTheScreenAtTopRight() {
+    func testDefaultWhiteboardFrameIsAboutAnEighthOfTheScreenAtTopRight() {
         let frame = WhiteboardWindowController.defaultFrame(on: NSRect(x: 0, y: 0, width: 1000, height: 800))
 
-        XCTAssertEqual(frame, NSRect(x: 634, y: 504, width: 350, height: 280))
+        XCTAssertEqual(frame, NSRect(x: 684, y: 448, width: 300, height: 336))
     }
 }

@@ -3,6 +3,7 @@ import {
   convertToExcalidrawElements,
   Excalidraw,
   exportToBlob,
+  getCommonBounds,
   newElementWith,
   restoreElements,
 } from "@excalidraw/excalidraw";
@@ -13,8 +14,35 @@ import "@excalidraw/excalidraw/index.css";
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { unsafeNarrow } from "../../unsafe-narrow.js";
-import type { CanvasCommand, WhiteboardAddElement, WhiteboardOperation } from "../../whiteboard.js";
-import { arrowBetween, AUTHOR_STROKE_COLORS, userEditPatches, type WhiteboardElement } from "../../whiteboard-scene.js";
+import type {
+  CanvasCommand,
+  PanDirection,
+  WhiteboardAddElement,
+  WhiteboardOperation,
+  WhiteboardView,
+  WhiteboardViewAction,
+} from "../../whiteboard.js";
+import {
+  arrowBetween,
+  AUTHOR_STROKE_COLORS,
+  boxCenter,
+  centeredView,
+  containsBox,
+  fittingZoom,
+  userEditPatches,
+  visibleArea,
+  type BoardPoint,
+  type CanvasViewport,
+  type WhiteboardBox,
+  type WhiteboardElement,
+} from "../../whiteboard-scene.js";
+
+declare global {
+  interface Window {
+    /** Present in DevSpace.app's web view: captures the window as the user sees it. */
+    webkit?: { messageHandlers: { devspaceSnapshot?: { postMessage(message: string): Promise<string> } } };
+  }
+}
 
 const API = "/desktop/whiteboard/api";
 const fragment = new URLSearchParams(location.hash.slice(1));
@@ -78,11 +106,6 @@ function handleChange(api: ExcalidrawImperativeAPI, elements: readonly Excalidra
 
   recordSeen(next);
   api.updateScene({ elements: next, captureUpdate: CaptureUpdateAction.NEVER });
-}
-
-interface BoardPoint {
-  x: number;
-  y: number;
 }
 
 interface LabelFont {
@@ -401,6 +424,150 @@ async function loadGlyphs(operations: WhiteboardOperation[]): Promise<void> {
   if (texts.length > 0) await document.fonts.load("20px Excalifont, Xiaolai", texts.join(""));
 }
 
+/** Zoom at or above which the whole board is still comfortable to read in the small window. */
+const READABLE_ZOOM = 0.6;
+const ZOOM_STEP = 1.25;
+
+function currentViewport(api: ExcalidrawImperativeAPI): CanvasViewport {
+  const state = api.getAppState();
+
+  return { width: state.width, height: state.height, zoom: state.zoom.value, scrollX: state.scrollX, scrollY: state.scrollY };
+}
+
+function moveView(api: ExcalidrawImperativeAPI, center: BoardPoint, zoom: number): void {
+  const next = centeredView(center, zoom, currentViewport(api));
+
+  api.updateScene({
+    appState: { scrollX: next.scrollX, scrollY: next.scrollY, zoom: unsafeNarrow({ value: next.zoom }) },
+    captureUpdate: CaptureUpdateAction.NEVER,
+  });
+}
+
+function boundsOf(elements: readonly ExcalidrawElement[]): WhiteboardBox | undefined {
+  if (elements.length === 0) return undefined;
+
+  const [minX, minY, maxX, maxY] = getCommonBounds(elements);
+
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+/** Shows `box` as large as fits between the toolbars, up to `maxZoom`. */
+function showBox(api: ExcalidrawImperativeAPI, box: WhiteboardBox, maxZoom: number): void {
+  moveView(api, boxCenter(box), fittingZoom(box, currentViewport(api), maxZoom));
+}
+
+/**
+ * Brings what the assistant just changed into view without fighting the
+ * user: a view that already shows it stays put; otherwise the whole board is
+ * shown when it stays readable, and the changed part when it would not.
+ */
+function revealChanges(api: ExcalidrawImperativeAPI, changedIds: ReadonlySet<string>): void {
+  const live = api.getSceneElements();
+  const changed = boundsOf(live.filter((element: ExcalidrawElement) => changedIds.has(element.id)));
+
+  if (!changed || containsBox(visibleArea(currentViewport(api)), changed)) return;
+
+  const board = boundsOf(live);
+
+  if (board && fittingZoom(board, currentViewport(api), 1) >= READABLE_ZOOM) {
+    showBox(api, board, 1);
+  } else {
+    showBox(api, changed, 1);
+  }
+}
+
+function changeView(
+  api: ExcalidrawImperativeAPI,
+  action: WhiteboardViewAction,
+  ids: string[] | undefined,
+  direction: PanDirection | undefined,
+): void {
+  const view = currentViewport(api);
+  const area = visibleArea(view);
+  const center = boxCenter(area);
+
+  switch (action) {
+    case "look": {
+      return;
+    }
+
+    case "fit": {
+      const board = boundsOf(api.getSceneElements());
+
+      if (board) showBox(api, board, 1);
+
+      return;
+    }
+
+    case "focus": {
+      const wanted = new Set(ids ?? []);
+      const targets = api.getSceneElements().filter((element: ExcalidrawElement) => wanted.has(element.id));
+      const missing = [...wanted].filter((id) => !targets.some((element: ExcalidrawElement) => element.id === id));
+
+      if (missing.length > 0) throw new Error(`No element with id "${missing[0]}" on the board.`);
+
+      const box = boundsOf(targets);
+
+      if (box) showBox(api, box, 1.5);
+
+      return;
+    }
+
+    case "zoom_in": {
+      moveView(api, center, view.zoom * ZOOM_STEP);
+
+      return;
+    }
+
+    case "zoom_out": {
+      moveView(api, center, view.zoom / ZOOM_STEP);
+
+      return;
+    }
+
+    case "pan": {
+      const dx = direction === "left" ? -area.width / 2 : direction === "right" ? area.width / 2 : 0;
+      const dy = direction === "up" ? -area.height / 2 : direction === "down" ? area.height / 2 : 0;
+
+      moveView(api, { x: center.x + dx, y: center.y + dy }, view.zoom);
+    }
+  }
+}
+
+function describeView(api: ExcalidrawImperativeAPI): WhiteboardView {
+  const view = currentViewport(api);
+  const area = visibleArea(view);
+
+  return {
+    zoom: Math.round(view.zoom * 100) / 100,
+    visible_area: {
+      x: Math.round(area.x),
+      y: Math.round(area.y),
+      width: Math.round(area.width),
+      height: Math.round(area.height),
+    },
+    window: { width: Math.round(view.width), height: Math.round(view.height) },
+  };
+}
+
+/** Waits until Excalidraw has painted the latest scene and view. */
+function painted(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+}
+
+/** A PNG of the window as the user sees it, toolbars included; the bare canvas outside DevSpace.app. */
+async function windowImage(): Promise<string | undefined> {
+  await painted();
+
+  const bridge = window.webkit?.messageHandlers.devspaceSnapshot;
+
+  if (bridge) return bridge.postMessage("snapshot");
+
+  const canvas = document.querySelector<HTMLCanvasElement>("canvas.excalidraw__canvas.static");
+
+  return canvas?.toDataURL("image/png").split(",")[1];
+}
+
 async function applyOperations(api: ExcalidrawImperativeAPI, operations: WhiteboardOperation[]): Promise<void> {
   await loadGlyphs(operations);
 
@@ -411,8 +578,7 @@ async function applyOperations(api: ExcalidrawImperativeAPI, operations: Whitebo
   const next = draft.finish();
   recordSeen(next);
   api.updateScene({ elements: next, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
-  // Leave room for the toolbars that cover the edges of the small window.
-  api.scrollToContent(undefined, { fitToViewport: true, viewportZoomFactor: 0.6, animate: true });
+  revealChanges(api, draft.edited);
 }
 
 async function boardImage(api: ExcalidrawImperativeAPI): Promise<string | undefined> {
@@ -443,6 +609,7 @@ interface CanvasReply {
   error?: string;
   elements?: readonly ExcalidrawElement[];
   image?: string;
+  view?: WhiteboardView;
 }
 
 async function runCommand(api: ExcalidrawImperativeAPI, command: CanvasCommand): Promise<void> {
@@ -451,13 +618,18 @@ async function runCommand(api: ExcalidrawImperativeAPI, command: CanvasCommand):
   try {
     if (command.kind === "update") await applyOperations(api, command.operations);
 
+    if (command.kind === "view") changeView(api, command.action, command.ids, command.direction);
+
+    // Excalidraw applies view changes on its next render.
+    await painted();
     reply.elements = api.getSceneElementsIncludingDeleted();
+    reply.view = describeView(api);
 
-    if (command.kind === "read" && command.include_image) {
-      const image = await boardImage(api);
+    const image = command.kind === "view"
+      ? await windowImage()
+      : command.kind === "read" && command.include_image ? await boardImage(api) : undefined;
 
-      if (image) reply.image = image;
-    }
+    if (image) reply.image = image;
   } catch (error) {
     reply.ok = false;
     reply.error = error instanceof Error ? error.message : String(error);
@@ -509,15 +681,15 @@ async function listen(api: ExcalidrawImperativeAPI): Promise<void> {
 }
 
 /**
- * A small tag above Excalidraw's bottom bar; the bar itself drops custom
- * footer content in small windows and fills with selection actions.
+ * Sits in the empty middle of Excalidraw's bottom bar, which drops custom
+ * footer content in small windows; it steps aside while a selection fills the
+ * bar with its own actions.
  */
 function Legend() {
   return (
     <div style={{
-      position: "fixed", bottom: 76, left: 12, zIndex: 5, pointerEvents: "none",
-      display: "flex", gap: 8, alignItems: "center", padding: "2px 6px", borderRadius: 6,
-      background: "rgba(255,255,255,0.85)", fontSize: 11, fontFamily: "system-ui, sans-serif", whiteSpace: "nowrap",
+      position: "fixed", bottom: 30, left: "50%", transform: "translateX(-50%)", zIndex: 5, pointerEvents: "none",
+      display: "flex", gap: 10, alignItems: "center", fontSize: 12, fontFamily: "system-ui, sans-serif", whiteSpace: "nowrap",
     }}>
       <span><span style={{ color: AUTHOR_STROKE_COLORS.assistant }}>●</span> ChatGPT</span>
       <span><span style={{ color: AUTHOR_STROKE_COLORS.user }}>●</span> 我</span>
@@ -528,6 +700,7 @@ function Legend() {
 function App() {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
   const [closed, setClosed] = useState(false);
+  const [selecting, setSelecting] = useState(false);
 
   useEffect(() => {
     if (!api) return;
@@ -541,10 +714,14 @@ function App() {
         excalidrawAPI={setApi}
         langCode="zh-CN"
         initialData={{ appState: { currentItemStrokeColor: AUTHOR_STROKE_COLORS.user } }}
-        onChange={(elements: readonly ExcalidrawElement[], appState: AppState) => { if (api) handleChange(api, elements, appState); }}
+        onChange={(elements: readonly ExcalidrawElement[], appState: AppState) => {
+          setSelecting(Object.keys(appState.selectedElementIds).length > 0);
+
+          if (api) handleChange(api, elements, appState);
+        }}
         UIOptions={{ canvasActions: { loadScene: false, saveToActiveFile: false, export: false, saveAsImage: false } }}
       />
-      <Legend />
+      {!selecting && <Legend />}
       {closed && (
         <div style={{
           position: "fixed", inset: 0, display: "grid", placeItems: "center",

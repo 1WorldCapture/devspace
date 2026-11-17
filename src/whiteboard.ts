@@ -30,6 +30,7 @@ export const WHITEBOARD_TOOL_NAMES = [
   "whiteboard_open",
   "whiteboard_update",
   "whiteboard_read",
+  "whiteboard_view",
   "whiteboard_close",
 ] as const;
 
@@ -70,6 +71,14 @@ export const whiteboardOperationSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("clear") }),
 ]);
 
+export const whiteboardViewActionSchema = z.enum(["look", "fit", "focus", "zoom_in", "zoom_out", "pan"]);
+
+export const panDirectionSchema = z.enum(["up", "down", "left", "right"]);
+
+export type WhiteboardViewAction = z.infer<typeof whiteboardViewActionSchema>;
+
+export type PanDirection = z.infer<typeof panDirectionSchema>;
+
 export type WhiteboardAddElement = z.infer<typeof addElementSchema>;
 
 export type WhiteboardOperation = z.infer<typeof whiteboardOperationSchema>;
@@ -77,7 +86,8 @@ export type WhiteboardOperation = z.infer<typeof whiteboardOperationSchema>;
 /** A command the canvas page carries out and answers on `/api/result`. */
 export type CanvasCommand =
   | { request_id: string; kind: "update"; operations: WhiteboardOperation[] }
-  | { request_id: string; kind: "read"; include_image: boolean };
+  | { request_id: string; kind: "read"; include_image: boolean }
+  | { request_id: string; kind: "view"; action: WhiteboardViewAction; ids?: string[]; direction?: PanDirection };
 
 const sceneElementSchema = z.object({
   id: z.string(),
@@ -106,6 +116,11 @@ const canvasResultSchema = z.object({
   error: z.string().optional(),
   elements: z.array(sceneElementSchema).optional(),
   image: z.string().optional(),
+  view: z.object({
+    zoom: z.number(),
+    visible_area: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
+    window: z.object({ width: z.number(), height: z.number() }),
+  }).optional(),
 });
 
 type CanvasResult = z.infer<typeof canvasResultSchema>;
@@ -133,8 +148,12 @@ export interface WhiteboardManagerOptions {
   buildDirectory?: string;
 }
 
+export type WhiteboardView = NonNullable<CanvasResult["view"]>;
+
 export interface WhiteboardSnapshot {
   elements: ReturnType<typeof summarizeScene>;
+  /** What the window shows: zoom, the board area visible between the toolbars, and the window size. */
+  view?: WhiteboardView;
   image?: string;
 }
 
@@ -199,6 +218,17 @@ export class WhiteboardManager {
 
   async read(includeImage: boolean): Promise<WhiteboardSnapshot> {
     return snapshot(await this.command({ request_id: randomUUID(), kind: "read", include_image: includeImage }));
+  }
+
+  /** Moves the window's view, then captures what the window shows. */
+  async view(action: WhiteboardViewAction, ids?: string[], direction?: PanDirection): Promise<WhiteboardSnapshot> {
+    const command: CanvasCommand = { request_id: randomUUID(), kind: "view", action };
+
+    if (ids) command.ids = ids;
+
+    if (direction) command.direction = direction;
+
+    return snapshot(await this.command(command));
   }
 
   /** Closes the window and discards the board. Returns false when nothing was open. */
@@ -368,6 +398,8 @@ function createSession(): WhiteboardSession {
 function snapshot(result: CanvasResult): WhiteboardSnapshot {
   const value: WhiteboardSnapshot = { elements: summarizeScene(result.elements ?? []) };
 
+  if (result.view) value.view = result.view;
+
   if (result.image) value.image = result.image;
 
   return value;
@@ -430,7 +462,9 @@ export function registerWhiteboardTools(
         "Add, update, or delete elements on the open whiteboard in one batch; all operations apply or none do. "
         + "Use labeled shapes for ideas and arrows with from/to ids to connect them; the board keeps the content in view, "
         + "so lay elements out on a roomy grid (for example 200x80 boxes, 80 units apart). "
-        + `${BOARD_GUIDE} Returns every element on the board afterwards.`,
+        + "The window brings changed elements into view when they are off screen and otherwise leaves the user's view alone. "
+        + `${BOARD_GUIDE} Returns every element on the board afterwards and view.visible_area, the board area the user sees; `
+        + "check the result with whiteboard_view after larger changes.",
       inputSchema: { operations: z.array(whiteboardOperationSchema).min(1) },
       annotations: { ...annotations, readOnlyHint: false, idempotentHint: false },
     },
@@ -447,13 +481,45 @@ export function registerWhiteboardTools(
       title: "Read whiteboard",
       description:
         "Read every element on the open whiteboard, including what the user drew. "
-        + `${BOARD_GUIDE} Set include_image to also get a picture of the board, for freehand drawings that text cannot describe.`,
+        + `${BOARD_GUIDE} Set include_image to also get a picture of the whole board regardless of the window's view, `
+        + "for freehand drawings that text cannot describe. To see what the user actually sees, use whiteboard_view.",
       inputSchema: { include_image: z.boolean().optional() },
       annotations: { ...annotations, readOnlyHint: true, idempotentHint: true },
     },
     ({ include_image: includeImage }) => runWhiteboardTool(config, "whiteboard_read", async () => {
       const { image, ...board } = await whiteboard.read(includeImage === true);
       const content: ToolContent[] = [textBlock(JSON.stringify(board))];
+
+      if (image) content.push({ type: "image", data: image, mimeType: "image/png" });
+
+      return content;
+    }),
+  );
+
+  server.registerTool(
+    "whiteboard_view",
+    {
+      title: "View whiteboard",
+      description:
+        "Adjust what the whiteboard window shows and return a screenshot of the window exactly as the user sees it, "
+        + "toolbars included, with view (zoom, visible_area in board units, window size in pixels). "
+        + "Actions: look (no change), fit (show the whole board), focus (show the elements in ids), "
+        + "zoom_in, zoom_out, and pan (move half a window in direction). "
+        + "Use it to check that a drawing is readable at the window's real size before describing it to the user.",
+      inputSchema: {
+        action: whiteboardViewActionSchema,
+        ids: z.array(z.string().min(1)).min(1).optional().describe("focus only: elements to bring into view."),
+        direction: panDirectionSchema.optional().describe("pan only: which way to move the view."),
+      },
+      annotations: { ...annotations, readOnlyHint: false, idempotentHint: false },
+    },
+    ({ action, ids, direction }) => runWhiteboardTool(config, "whiteboard_view", async () => {
+      if (action === "focus" && !ids) throw new WhiteboardError("focus needs ids.");
+
+      if (action === "pan" && !direction) throw new WhiteboardError("pan needs a direction.");
+
+      const { image, ...board } = await whiteboard.view(action, ids, direction);
+      const content: ToolContent[] = [textBlock(JSON.stringify(board.view ?? {}))];
 
       if (image) content.push({ type: "image", data: image, mimeType: "image/png" });
 

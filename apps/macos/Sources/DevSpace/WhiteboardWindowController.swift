@@ -33,8 +33,12 @@ final class WhiteboardWindowController: NSObject, NSWindowDelegate {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
 
+        let snapshots = SnapshotBridge()
+        configuration.userContentController.addScriptMessageHandler(snapshots, contentWorld: .page, name: SnapshotBridge.name)
+
         let webView = WKWebView(frame: panel.contentLayoutRect, configuration: configuration)
         webView.autoresizingMask = [.width, .height]
+        snapshots.webView = webView
         panel.contentView = webView
         webView.load(URLRequest(url: url))
 
@@ -48,7 +52,10 @@ final class WhiteboardWindowController: NSObject, NSWindowDelegate {
 
         self.panel = nil
         panel.delegate = nil
-        (panel.contentView as? WKWebView)?.stopLoading()
+        if let webView = panel.contentView as? WKWebView {
+            webView.configuration.userContentController.removeAllScriptMessageHandlers()
+            webView.stopLoading()
+        }
         panel.contentView = nil
         panel.close()
     }
@@ -57,10 +64,11 @@ final class WhiteboardWindowController: NSObject, NSWindowDelegate {
         close()
     }
 
-    /// About an eighth of the screen (35% of each side), in the top-right corner.
+    /// About an eighth of the screen, in the top-right corner. It is taller
+    /// than the screen's shape because Excalidraw's toolbars take height.
     static func defaultFrame(on screen: NSRect) -> NSRect {
-        let width = (screen.width * 0.35).rounded()
-        let height = (screen.height * 0.35).rounded()
+        let width = (screen.width * 0.3).rounded()
+        let height = (screen.height * 0.42).rounded()
         let margin: CGFloat = 16
 
         return NSRect(
@@ -69,5 +77,44 @@ final class WhiteboardWindowController: NSObject, NSWindowDelegate {
             width: width,
             height: height
         )
+    }
+}
+
+/// Lets the whiteboard page capture the window exactly as the user sees it,
+/// toolbars included, so the host can judge the drawing at its real size.
+@MainActor
+final class SnapshotBridge: NSObject, WKScriptMessageHandlerWithReply {
+    static let name = "devspaceSnapshot"
+
+    /// Widest snapshot in points; the image is twice that on Retina screens.
+    private static let maxWidth: CGFloat = 900
+
+    weak var webView: WKWebView?
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void
+    ) {
+        guard let webView else {
+            replyHandler(nil, "The whiteboard window is closed.")
+
+            return
+        }
+
+        let configuration = WKSnapshotConfiguration()
+        configuration.snapshotWidth = NSNumber(value: Double(min(webView.bounds.width, Self.maxWidth)))
+
+        webView.takeSnapshot(with: configuration) { image, error in
+            guard let image,
+                  let tiff = image.tiffRepresentation,
+                  let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+                replyHandler(nil, error?.localizedDescription ?? "The window could not be captured.")
+
+                return
+            }
+
+            replyHandler(png.base64EncodedString(), nil)
+        }
     }
 }

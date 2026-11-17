@@ -92,11 +92,12 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-`pnpm build` cleans `dist/`, then runs three independent outputs:
+`pnpm build` cleans `dist/`, then runs four independent outputs:
 
 1. `vite build` — MCP widget cards from `src/ui/workspace-app.html` into `dist/ui`.
 2. `vite build -c vite.web.config.ts` — workspace web pages from `src/ui/web` into `dist/web` (served under `/web/`).
-3. `tsc -p tsconfig.build.json` — server and CLI into `dist/`, excluding `src/ui`, tests, and `src/test-support`.
+3. `vite build -c vite.whiteboard.config.ts` — the Excalidraw whiteboard page from `src/ui/whiteboard` into `dist/whiteboard` (served under `/desktop/whiteboard/`), with Excalidraw's fonts copied beside it so it never loads them from a CDN.
+4. `tsc -p tsconfig.build.json` — server and CLI into `dist/`, excluding `src/ui`, tests, and `src/test-support`.
 
 `npm pack` runs `pnpm build` via `prepack`. Only `bin`, `dist`, `examples`, `schema`, `scripts`, `skills`, and `README.md` are packed.
 
@@ -133,6 +134,10 @@ devspace -v && devspace doctor
 ### macOS screen capture
 
 `capture_screen` is registered only on macOS and shells out to `osascript`, `screencapture`, and `sips`. macOS attributes Screen Recording permission to the app that launched DevSpace (the terminal), not to `devspace` itself; after granting it, that app and DevSpace must be restarted.
+
+### Desktop whiteboard
+
+The `whiteboard_*` tools (`src/whiteboard.ts`) exist only on macOS when DevSpace.app started the server: the app passes a random `DEVSPACE_DESKTOP_TOKEN`, subscribes to `/desktop/events`, and shows the Excalidraw page in a floating `NSPanel`. A terminal `devspace serve` has no token, so it registers no whiteboard tools. Every `/desktop` route requires that token; requests through the user's tunnel also arrive from loopback, so the peer address proves nothing. The canvas page owns the scene: it applies the host's operations, records `author` and `lastEditor` in each element's `customData`, and forces each element's stroke color to its original author's (`src/whiteboard-scene.ts`). The page also owns the view: after an update it brings changed elements into view only when they are off screen, and `whiteboard_view` moves the view and returns a native `WKWebView` snapshot of the window (through the `devspaceSnapshot` script message handler), so the host sees the drawing at the window's real size with the toolbars covering it. `TOOLBAR_INSETS` must match the space Excalidraw's toolbars cover in that window. Closing the window or calling `whiteboard_close` discards the board.
 
 ## Verification
 

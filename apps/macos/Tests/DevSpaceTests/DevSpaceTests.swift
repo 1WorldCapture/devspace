@@ -171,3 +171,23 @@ final class CommandRunnerTests: XCTestCase {
         }
     }
 }
+
+final class DesktopEventTests: XCTestCase {
+    func testParsesWhiteboardEvents() {
+        XCTAssertEqual(
+            DesktopEvent.parse(#"{"type":"whiteboard.open","path":"/desktop/whiteboard/#session=s&token=t"}"#),
+            .openWhiteboard(path: "/desktop/whiteboard/#session=s&token=t")
+        )
+        XCTAssertEqual(DesktopEvent.parse(#"{"type":"whiteboard.close"}"#), .closeWhiteboard)
+        // A path that is not on this server is refused.
+        XCTAssertNil(DesktopEvent.parse(#"{"type":"whiteboard.open","path":"https://evil.example"}"#))
+        XCTAssertNil(DesktopEvent.parse(#"{"type":"other"}"#))
+    }
+
+    @MainActor
+    func testDefaultWhiteboardFrameIsAboutAnEighthOfTheScreenAtTopRight() {
+        let frame = WhiteboardWindowController.defaultFrame(on: NSRect(x: 0, y: 0, width: 1000, height: 800))
+
+        XCTAssertEqual(frame, NSRect(x: 684, y: 448, width: 300, height: 336))
+    }
+}

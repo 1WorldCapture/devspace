@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import Observation
 
 enum ServerState: Equatable {
@@ -38,6 +39,8 @@ final class ServerController {
     @ObservationIgnored private var healthTask: Task<Void, Never>?
     @ObservationIgnored private var restartTask: Task<Void, Never>?
     @ObservationIgnored private var logHandle: FileHandle?
+    @ObservationIgnored private let desktopEvents = DesktopEventClient()
+    @ObservationIgnored private let whiteboard = WhiteboardWindowController()
 
     var version: String? { runtime.devspaceVersion }
 
@@ -186,7 +189,11 @@ final class ServerController {
         let process = Process()
         process.executableURL = runtime.nodeExecutable
         process.arguments = [runtime.entryPoint.path, "serve"]
-        process.environment = environment
+        // The desktop token lets this app, and only this app, open the whiteboard window.
+        let desktopToken = Self.randomToken()
+        var processEnvironment = environment
+        processEnvironment["DEVSPACE_DESKTOP_TOKEN"] = desktopToken
+        process.environment = processEnvironment
         process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = handle
@@ -214,6 +221,7 @@ final class ServerController {
         self.process = process
         logHandle = handle
         launchedAt = Date()
+        subscribeToDesktopEvents(baseURL: config.localBaseURL, token: desktopToken)
         monitorHealth(config: config, generation: launchGeneration)
     }
 
@@ -239,8 +247,33 @@ final class ServerController {
         }
     }
 
+    private func subscribeToDesktopEvents(baseURL: URL, token: String) {
+        desktopEvents.start(baseURL: baseURL, token: token) { [weak self] event in
+            guard let self else { return }
+
+            switch event {
+            case .openWhiteboard(let path):
+                guard let url = URL(string: baseURL.absoluteString + path) else { return }
+
+                self.whiteboard.open(url: url)
+            case .closeWhiteboard:
+                self.whiteboard.close()
+            }
+        }
+    }
+
+    private static func randomToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
     private func handleExit(generation exitedGeneration: Int, status: Int32) {
         guard exitedGeneration == generation else { return }
+
+        desktopEvents.stop()
+        whiteboard.close()
 
         healthTask?.cancel()
         healthTask = nil

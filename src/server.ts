@@ -28,6 +28,7 @@ import {
   registerArtifactTools,
 } from "./artifact-tools.js";
 import { isScreenCaptureSupportedPlatform, registerScreenCaptureTool } from "./screen-capture.js";
+import { DESKTOP_PATH, DESKTOP_TOKEN_ENV, registerWhiteboardTools, WhiteboardManager } from "./whiteboard.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
@@ -407,6 +408,7 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   trackToolActivity?: TrackToolActivity,
   workspaceActivityJournal?: WorkspaceActivityJournal,
+  whiteboard?: WhiteboardManager,
 ): McpServer {
   const toolSurface = getToolSurface(config.experimentalCodeMode ? "codex" : surface);
 
@@ -432,6 +434,7 @@ export function createMcpServer(
     codeModeRegistry,
     codeModeExecutions,
     workspaceActivityJournal,
+    whiteboard,
   );
 
   if (codeModeExecutions) {
@@ -465,6 +468,7 @@ function registerMcpSurface(
   codeModeRegistry?: CodeModeRegistry,
   codeModeExecutions?: CodeModeExecutions,
   workspaceActivityJournal?: WorkspaceActivityJournal,
+  whiteboard?: WhiteboardManager,
 ): void {
   const registrationTarget = trackToolActivity || workspaceActivityJournal
     ? withObservedToolHandlers(server, { trackToolActivity, workspaceActivityJournal })
@@ -930,6 +934,10 @@ function registerMcpSurface(
     registerScreenCaptureTool(registrationTarget, config);
   }
 
+  if (whiteboard) {
+    registerWhiteboardTools(registrationTarget, config, whiteboard);
+  }
+
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
     registerArtifactTools(registrationTarget, {
       config,
@@ -1100,6 +1108,13 @@ export function createServer(
   const toolActivities = new ToolActivityTracker();
   const workspaceActivity = new WorkspaceActivityStore(config.stateDir, config.activity.maxTurns);
 
+  // Only DevSpace.app sets the desktop token; it is the app that shows the window.
+  const desktopToken = process.env[DESKTOP_TOKEN_ENV];
+
+  const whiteboard = isScreenCaptureSupportedPlatform() && desktopToken
+    ? new WhiteboardManager(desktopToken)
+    : undefined;
+
   const workspaceActivityJournal = config.activity.enabled
     ? new WorkspaceActivityJournal(workspaceActivity, (error) => {
       logEvent(config.logging, "warn", "workspace_activity_journal_error", {
@@ -1135,6 +1150,7 @@ export function createServer(
         codeModeRegistry,
         codeModeExecutions,
         workspaceActivityJournal,
+        whiteboard,
       );
     });
 
@@ -1277,6 +1293,8 @@ export function createServer(
     workspaces,
   }));
 
+  if (whiteboard) app.use(DESKTOP_PATH, whiteboard.router());
+
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "devspace" });
   });
@@ -1369,6 +1387,7 @@ export function createServer(
         await toolActivities.waitForIdle();
         workspaceActivity.close();
         processSessions.shutdown();
+        whiteboard?.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

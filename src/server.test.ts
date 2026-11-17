@@ -18,6 +18,7 @@ import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
 import { isLocalAgentDriverKind } from "./local-agent-provider.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { CAPTURE_SCREEN_TOOL_NAME, isScreenCaptureSupportedPlatform } from "./screen-capture.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import {
@@ -40,6 +41,9 @@ import { WorkspaceActivityStore } from "./workspace-activity-store.js";
 
 const execFileAsync = promisify(execFile);
 
+// Machine-level tools registered next to every tool surface on this platform.
+const platformTools = isScreenCaptureSupportedPlatform() ? [CAPTURE_SCREEN_TOOL_NAME] : [];
+
 test("tool surfaces expose the expected host-facing tools", async (t) => {
   const cases: Array<{
     surface: ToolSurfaceName;
@@ -47,11 +51,11 @@ test("tool surfaces expose the expected host-facing tools", async (t) => {
   }> = [
     {
       surface: "claude",
-      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes"],
+      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes", ...platformTools],
     },
     {
       surface: "codex",
-      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes"],
+      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes", ...platformTools],
     },
   ];
 
@@ -72,8 +76,8 @@ test("experimental Code Mode bootstraps real tools and executes through MCP", as
   const context = await fixture(t, { experimentalCodeMode: true, uiEnabled: false, git: true });
   const listed = await context.client.listTools();
   assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [
-    "cancel_execution", "execute", "open_workspace", "poll_execution", "show_changes",
-  ]);
+    "cancel_execution", "execute", "open_workspace", "poll_execution", "show_changes", ...platformTools,
+  ].sort());
 
   const opened = await callOpen(context.client, context.project);
   // SAFETY: The surrounding checks or construction already match this type.
@@ -1179,8 +1183,8 @@ test("experimental Code Mode executes over stateless HTTP MCP requests", async (
   // SAFETY: The surrounding checks or construction already match this type.
   const inventory = await listed.json() as { result?: { tools?: Array<{ name: string }> } };
   assert.deepEqual(inventory.result?.tools?.map((tool) => tool.name).sort(), [
-    "cancel_execution", "execute", "open_workspace", "poll_execution", "show_changes",
-  ]);
+    "cancel_execution", "execute", "open_workspace", "poll_execution", "show_changes", ...platformTools,
+  ].sort());
 
   const opened = await postModernMcp(localBaseUrl, accessToken, "tools/call", {
     name: "open_workspace",

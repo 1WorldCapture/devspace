@@ -159,7 +159,8 @@ function parsePublicBaseUrl(value: string): string {
   return parsed.toString().replace(/\/$/, "");
 }
 
-function localPublicBaseUrl(host: string, port: number): string {
+/** Loopback-reachable base URL of the local server. */
+export function localPublicBaseUrl(host: string, port: number): string {
   const publicHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
 
   const formattedHost = publicHost.includes(":") && !publicHost.startsWith("[")

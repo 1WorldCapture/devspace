@@ -39,6 +39,15 @@ struct DevSpaceCLI {
         try await run(Self.initArguments(roots: roots, publicURL: publicURL), timeout: 120, label: "init")
     }
 
+    /// Prompt that connects a local coding agent to the loopback MCP URL.
+    func connectPrompt() async throws -> String {
+        let result = try await run(["connect"])
+
+        guard result.succeeded else { throw DevSpaceCLIError.commandFailed("connect", result.failureDescription) }
+
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func doctor() async throws -> String {
         let result = try await run(["doctor"], timeout: 120)
 

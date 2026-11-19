@@ -42,6 +42,7 @@ import {
 } from "./logger.js";
 import { readFileTool } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import { isLocalAccessRequest, LOCAL_ACCESS_CLIENT_ID, localAccessToken } from "./local-access.js";
 import {
   compileMcpRegistrationSurface,
   createModernMcpServerAdapter,
@@ -1100,6 +1101,8 @@ export function createServer(
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
 
+  const localToken = localAccessToken(config.oauth.ownerToken);
+
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
@@ -1304,17 +1307,26 @@ export function createServer(
     // SAFETY: The surrounding checks or construction already match this type.
     const requestId = res.locals.requestId as string | undefined;
 
-    await new Promise<void>((resolve, reject) => {
-      res.once("finish", resolve);
-      res.once("close", resolve);
-      bearerAuth(req, res, (error?: WireInput) => {
-        if (error) reject(error);
-        else resolve();
+    if (isLocalAccessRequest(req, localToken)) {
+      req.auth = {
+        token: localToken,
+        clientId: LOCAL_ACCESS_CLIENT_ID,
+        scopes: config.oauth.scopes,
+        resource: resourceServerUrl,
+      };
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        res.once("finish", resolve);
+        res.once("close", resolve);
+        bearerAuth(req, res, (error?: WireInput) => {
+          if (error) reject(error);
+          else resolve();
+        });
       });
-    });
 
-    // A client that disconnected mid-auth has nothing left to answer.
-    if (res.headersSent || res.destroyed) return;
+      // A client that disconnected mid-auth has nothing left to answer.
+      if (res.headersSent || res.destroyed) return;
+    }
 
     if (!req.auth?.resource || !oauthProvider.isResourceAllowed(req.auth.resource)) {
       logEvent(config.logging, "warn", "auth_denied", {

@@ -13,7 +13,8 @@ import {
   installAgentsSkill,
   renderAgentsSkill,
 } from "./agents-skill.js";
-import { loadAgentConfig, loadConfig } from "./config.js";
+import { loadAgentConfig, loadConfig, localPublicBaseUrl } from "./config.js";
+import { localAccessToken, localAgentConnectPrompt } from "./local-access.js";
 import type { AgentConfig, ServerConfig } from "./config.js";
 import { resolveCliWorkspaceContext } from "./cli-workspace.js";
 import {
@@ -82,6 +83,7 @@ type Command =
   | "init"
   | "doctor"
   | "config"
+  | "connect"
   | "worktrees"
   | "agents"
   | "workflow"
@@ -116,6 +118,10 @@ async function main(argv: string[]): Promise<void> {
       return;
     case "config":
       runConfigCommand(args);
+
+      return;
+    case "connect":
+      runConnect(args);
 
       return;
     case "worktrees":
@@ -155,6 +161,7 @@ function normalizeCommand(command: string | undefined): Command {
     command === "init"
     || command === "doctor"
     || command === "config"
+    || command === "connect"
     || command === "worktrees"
     || command === "agents"
     || command === "show-changes"
@@ -507,7 +514,7 @@ async function serve(): Promise<void> {
       console.warn("warning: Host header allowlist is disabled because server.allowedHosts contains '*'");
     }
 
-    console.log("auth: Owner password approval required");
+    console.log("auth: Owner password approval required; local agents can use the token from `devspace connect`");
     console.log(`workspace pages: ${workspaceWebUrl(config)} (sign in with the owner password)`);
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
     console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
@@ -685,6 +692,7 @@ function printHelp(): void {
       "                           Create or update ~/.devspace/config.jsonc and auth.json",
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
+      "  devspace connect         Print a prompt that connects a local coding agent to DevSpace MCP",
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace worktrees prune Prune managed worktrees unused for 3 days",
       "  devspace show-changes <review-ref> [--json]",
@@ -706,6 +714,15 @@ function printHelp(): void {
       "  devspace serve",
     ].join("\n"),
   );
+}
+
+function runConnect(args: string[]): void {
+  if (args.length > 0) throw new Error("Usage: devspace connect");
+
+  const config = loadConfig();
+  const mcpUrl = `${localPublicBaseUrl(config.host, config.port)}/mcp`;
+
+  console.log(localAgentConnectPrompt(mcpUrl, localAccessToken(config.oauth.ownerToken)));
 }
 
 async function runShowChanges(args: string[]): Promise<void> {

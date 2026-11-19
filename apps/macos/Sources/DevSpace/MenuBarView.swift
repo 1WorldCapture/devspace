@@ -101,6 +101,10 @@ struct MenuBarView: View {
             }
 
             copyRow(title: "本地地址", value: config.localMCPURL.absoluteString)
+
+            Button("复制本地 Agent 接入 Prompt") { Task { await copyConnectPrompt() } }
+                .buttonStyle(.borderless)
+                .help("粘贴给 Claude Code、Codex、Cursor 等本机 agent，让它把本地地址配置成 MCP 服务器。Prompt 内含访问 token。")
         }
     }
 
@@ -260,6 +264,17 @@ struct MenuBarView: View {
             show("已复制 Owner 密码")
         } catch {
             show("无法读取 \(abbreviateHome(location.authFile.path))：\(error.localizedDescription)")
+        }
+    }
+
+    private func copyConnectPrompt() async {
+        guard let cli = controller.cli else { return }
+
+        do {
+            copy(try await cli.connectPrompt())
+            show("已复制接入 Prompt，粘贴给本机 agent 即可")
+        } catch {
+            show(error.localizedDescription)
         }
     }
 

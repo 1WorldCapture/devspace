@@ -127,6 +127,19 @@ runs as, so a non-interactive session needs the same logins and environment as
 an interactive one. See [CLI](/reference/cli#safe-retries) for the request-ID
 format and the arguments that must match on a retry.
 
+## Use the MCP tools from a local agent
+
+To give a local agent DevSpace's MCP tools as well, connect it to the loopback
+`/mcp` URL with a static token instead of OAuth. Run `devspace connect` (or
+use the local agent prompt button in the menu bar app) and paste the printed
+prompt into the agent; it adds DevSpace to its own MCP configuration.
+
+The token is derived from the owner password, so changing that password revokes
+it. DevSpace accepts it only from a loopback connection that names a loopback
+Host such as `127.0.0.1` or `localhost`, so it does not work through a tunnel
+that forwards its public Host. The prompt contains the token, so it reaches the
+agent's model provider along with the conversation.
+
 ## Write authority
 
 | Mode | Meaning |

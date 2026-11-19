@@ -7,7 +7,7 @@ import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
 import { logToolCall, textBlock } from "./tool-surfaces/shared.js";
 import type { ToolContent } from "./tool-surfaces/types.js";
-import { summarizeScene } from "./whiteboard-scene.js";
+import { summarizeChanges, summarizeScene, type WhiteboardChanges } from "./whiteboard-scene.js";
 
 /**
  * The desktop whiteboard: a floating Excalidraw window that DevSpace.app shows
@@ -115,6 +115,8 @@ const canvasResultSchema = z.object({
   ok: z.boolean(),
   error: z.string().optional(),
   elements: z.array(sceneElementSchema).optional(),
+  /** Update only: ids of the elements the batch drew, edited, or deleted. */
+  changed_ids: z.array(z.string()).optional(),
   image: z.string().optional(),
   view: z.object({
     zoom: z.number(),
@@ -155,6 +157,11 @@ export interface WhiteboardSnapshot {
   /** What the window shows: zoom, the board area visible between the toolbars, and the window size. */
   view?: WhiteboardView;
   image?: string;
+}
+
+/** What one whiteboard_update changed, and what the window shows afterwards. */
+export interface WhiteboardUpdate extends WhiteboardChanges {
+  view?: WhiteboardView;
 }
 
 export class WhiteboardManager {
@@ -212,8 +219,13 @@ export class WhiteboardManager {
     return { alreadyOpen: false };
   }
 
-  async update(operations: WhiteboardOperation[]): Promise<WhiteboardSnapshot> {
-    return snapshot(await this.command({ request_id: randomUUID(), kind: "update", operations }));
+  async update(operations: WhiteboardOperation[]): Promise<WhiteboardUpdate> {
+    const result = await this.command({ request_id: randomUUID(), kind: "update", operations });
+    const value: WhiteboardUpdate = summarizeChanges(result.elements ?? [], result.changed_ids ?? []);
+
+    if (result.view) value.view = result.view;
+
+    return value;
   }
 
   async read(includeImage: boolean): Promise<WhiteboardSnapshot> {
@@ -462,9 +474,13 @@ export function registerWhiteboardTools(
         "Add, update, or delete elements on the open whiteboard in one batch; all operations apply or none do. "
         + "Use labeled shapes for ideas and arrows with from/to ids to connect them; the board keeps the content in view, "
         + "so lay elements out on a roomy grid (for example 200x80 boxes, 80 units apart). "
+        + "The user sees nothing until a call arrives, so build a diagram over several calls of about 3 to 6 elements each, "
+        + "for example the main shapes first, then the arrows between them, then notes and colors; "
+        + "the window draws each batch's elements one after another. "
         + "The window brings changed elements into view when they are off screen and otherwise leaves the user's view alone. "
-        + `${BOARD_GUIDE} Returns every element on the board afterwards and view.visible_area, the board area the user sees; `
-        + "check the result with whiteboard_view after larger changes.",
+        + `${BOARD_GUIDE} Returns the elements this call changed, the ids it deleted, element_count, `
+        + "and view.visible_area, the board area the user sees; use whiteboard_read for the whole board, "
+        + "and check the result with whiteboard_view after larger changes.",
       inputSchema: { operations: z.array(whiteboardOperationSchema).min(1) },
       annotations: { ...annotations, readOnlyHint: false, idempotentHint: false },
     },

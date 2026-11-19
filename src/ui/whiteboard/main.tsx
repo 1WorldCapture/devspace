@@ -62,9 +62,12 @@ for (const type of ["pointerdown", "pointerup", "keydown", "paste", "drop"]) {
   window.addEventListener(type, () => { lastUserInputAt = Date.now(); }, true);
 }
 
+/**
+ * Adds to what was seen rather than replacing it: while a batch is being
+ * drawn, the scene lacks the assistant's elements that have not appeared yet,
+ * and forgetting them would credit them to the user when they do.
+ */
 function recordSeen(elements: readonly ExcalidrawElement[]): void {
-  seenVersions.clear();
-
   for (const element of elements) seenVersions.set(element.id, element.version);
 }
 
@@ -195,7 +198,8 @@ class Draft {
   constructor(current: readonly ExcalidrawElement[]) {
     for (const element of current) this.elements.set(element.id, element);
 
-    this.originalIds = new Set(this.elements.keys());
+    // An id reused after its element was deleted names a new element.
+    this.originalIds = new Set(current.flatMap((element) => element.isDeleted ? [] : [element.id]));
   }
 
   live(id: string): ExcalidrawElement {
@@ -457,20 +461,20 @@ function showBox(api: ExcalidrawImperativeAPI, box: WhiteboardBox, maxZoom: numb
 }
 
 /**
- * Brings what the assistant just changed into view without fighting the
+ * Brings what the assistant is about to show into view without fighting the
  * user: a view that already shows it stays put; otherwise the whole board is
  * shown when it stays readable, and the changed part when it would not.
  */
-function revealChanges(api: ExcalidrawImperativeAPI, changedIds: ReadonlySet<string>): void {
-  const live = api.getSceneElements();
-  const changed = boundsOf(live.filter((element: ExcalidrawElement) => changedIds.has(element.id)));
+function revealChanges(api: ExcalidrawImperativeAPI, board: readonly ExcalidrawElement[], changedIds: ReadonlySet<string>): void {
+  const live = board.filter((element) => !element.isDeleted);
+  const changed = boundsOf(live.filter((element) => changedIds.has(element.id)));
 
   if (!changed || containsBox(visibleArea(currentViewport(api)), changed)) return;
 
-  const board = boundsOf(live);
+  const whole = boundsOf(live);
 
-  if (board && fittingZoom(board, currentViewport(api), 1) >= READABLE_ZOOM) {
-    showBox(api, board, 1);
+  if (whole && fittingZoom(whole, currentViewport(api), 1) >= READABLE_ZOOM) {
+    showBox(api, whole, 1);
   } else {
     showBox(api, changed, 1);
   }
@@ -568,17 +572,138 @@ async function windowImage(): Promise<string | undefined> {
   return canvas?.toDataURL("image/png").split(",")[1];
 }
 
-async function applyOperations(api: ExcalidrawImperativeAPI, operations: WhiteboardOperation[]): Promise<void> {
+/** Pause between new elements as a batch is drawn, shortened so a batch takes at most REVEAL_TOTAL_MS. */
+const REVEAL_STEP_MS = 120;
+const REVEAL_TOTAL_MS = 1500;
+
+/**
+ * Orders a batch's new elements the way a person would draw them: shapes in
+ * reading order, each with its label, and every arrow as soon as both of its
+ * ends are on the board. Arrows without both ends come last.
+ */
+function revealSteps(next: readonly ExcalidrawElement[], originalIds: ReadonlySet<string>): ExcalidrawElement[][] {
+  const added = next.filter((element) => !element.isDeleted && !originalIds.has(element.id));
+  const addedIds = new Set(added.map((element) => element.id));
+  const groups = new Map<string, ExcalidrawElement[]>();
+
+  for (const element of added) {
+    const container = element.type === "text" ? element.containerId : null;
+    const owner = container && addedIds.has(container) ? container : element.id;
+
+    groups.set(owner, [...groups.get(owner) ?? [], element]);
+  }
+
+  const owners = added.filter((element) => groups.has(element.id));
+  const shown = new Set([...originalIds].filter((id) => !addedIds.has(id)));
+  const arrows = owners.filter((element) => element.type === "arrow");
+  const nodes = owners.filter((element) => element.type !== "arrow").sort((a, b) => a.y - b.y || a.x - b.x);
+  const steps: ExcalidrawElement[][] = [];
+
+  const takeArrows = (ready: (arrow: ExcalidrawElement) => boolean) => {
+    for (const arrow of arrows) {
+      if (shown.has(arrow.id) || !ready(arrow)) continue;
+
+      shown.add(arrow.id);
+      steps.push(groups.get(arrow.id) ?? [arrow]);
+    }
+  };
+
+  const ended = (arrow: ExcalidrawElement) => arrow.type === "arrow"
+    && arrow.startBinding !== null && shown.has(arrow.startBinding.elementId)
+    && arrow.endBinding !== null && shown.has(arrow.endBinding.elementId);
+
+  takeArrows(ended);
+
+  for (const node of nodes) {
+    shown.add(node.id);
+    steps.push(groups.get(node.id) ?? [node]);
+    takeArrows(ended);
+  }
+
+  takeArrows(() => true);
+
+  return steps;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Applies a batch, then draws its new elements one step at a time so the user
+ * sees the diagram grow. Nothing shows unless every operation succeeds; edits
+ * to existing elements and deletions show at once, and the whole batch stays
+ * one undo step.
+ */
+async function applyOperations(api: ExcalidrawImperativeAPI, operations: WhiteboardOperation[]): Promise<string[]> {
   await loadGlyphs(operations);
 
-  const draft = new Draft(api.getSceneElementsIncludingDeleted());
+  const current = api.getSceneElementsIncludingDeleted();
+  const draft = new Draft(current);
 
   for (const operation of operations) draft.apply(operation);
 
   const next = draft.finish();
+  const steps = revealSteps(next, draft.originalIds);
+  const pending = new Set(steps.slice(1).flat().map((element) => element.id));
+
   recordSeen(next);
-  api.updateScene({ elements: next, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
-  revealChanges(api, draft.edited);
+  revealChanges(api, next, draft.edited);
+
+  if (steps.length <= 1) {
+    api.updateScene({ elements: next, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
+
+    return [...draft.edited];
+  }
+
+  api.updateScene({ elements: next.filter((element) => !pending.has(element.id)), captureUpdate: CaptureUpdateAction.EVENTUALLY });
+
+  const pause = Math.min(REVEAL_STEP_MS, REVEAL_TOTAL_MS / steps.length);
+
+  for (const [index, step] of steps.slice(1).entries()) {
+    await wait(pause);
+
+    // Start from the live scene so what the user does meanwhile is kept.
+    const live = api.getSceneElementsIncludingDeleted();
+
+    if (index === steps.length - 2) {
+      commitBatch(api, live, step, current, next);
+    } else {
+      api.updateScene({ elements: [...live, ...step], captureUpdate: CaptureUpdateAction.EVENTUALLY });
+    }
+  }
+
+  return [...draft.edited];
+}
+
+/**
+ * Shows the last step and records the whole batch as one undo step.
+ * Excalidraw leaves elements it shows but has not committed out of an undo
+ * step, so the batch's earlier steps are first put back the way the board
+ * was before it, in the same tick, so nothing flickers.
+ */
+function commitBatch(
+  api: ExcalidrawImperativeAPI,
+  live: readonly ExcalidrawElement[],
+  step: readonly ExcalidrawElement[],
+  before: readonly ExcalidrawElement[],
+  next: readonly ExcalidrawElement[],
+): void {
+  const original = new Map(before.map((element) => [element.id, element]));
+  const batch = new Map(next.map((element) => [element.id, element]));
+
+  const rolledBack = live.flatMap((element) => {
+    if (batch.get(element.id)?.version !== element.version) return [element];
+
+    const previous = original.get(element.id);
+
+    if (!previous) return [];
+
+    return [previous];
+  });
+
+  api.updateScene({ elements: rolledBack, captureUpdate: CaptureUpdateAction.EVENTUALLY });
+  api.updateScene({ elements: [...live, ...step], captureUpdate: CaptureUpdateAction.IMMEDIATELY });
 }
 
 async function boardImage(api: ExcalidrawImperativeAPI): Promise<string | undefined> {
@@ -608,6 +733,7 @@ interface CanvasReply {
   ok: boolean;
   error?: string;
   elements?: readonly ExcalidrawElement[];
+  changed_ids?: string[];
   image?: string;
   view?: WhiteboardView;
 }
@@ -616,7 +742,7 @@ async function runCommand(api: ExcalidrawImperativeAPI, command: CanvasCommand):
   const reply: CanvasReply = { session, request_id: command.request_id, ok: true };
 
   try {
-    if (command.kind === "update") await applyOperations(api, command.operations);
+    if (command.kind === "update") reply.changed_ids = await applyOperations(api, command.operations);
 
     if (command.kind === "view") changeView(api, command.action, command.ids, command.direction);
 

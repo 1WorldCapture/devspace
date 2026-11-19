@@ -14,6 +14,7 @@ import {
   boxCenter,
   centeredView,
   fittingZoom,
+  summarizeChanges,
   summarizeScene,
   visibleArea,
   userEditPatches,
@@ -76,6 +77,24 @@ test("scene summaries fold labels into their container and report arrow ends", (
     { id: "arrow", text: undefined, from: "a", to: "b", author: "assistant", last_editor: "assistant" },
   ]);
   assert.deepEqual([summary[0]?.x, summary[0]?.y], [10, 21]);
+});
+
+test("update results describe only what the batch changed", () => {
+  const changes = summarizeChanges([
+    element("kept"),
+    element("relabeled"),
+    element("relabeled-label", { type: "text", text: "New", containerId: "relabeled" }),
+    element("added", { type: "ellipse" }),
+    element("removed", { isDeleted: true }),
+    element("removed-label", { type: "text", text: "Old", containerId: "removed", isDeleted: true }),
+  ], ["relabeled-label", "added", "removed", "removed-label", "unknown"]);
+
+  assert.deepEqual(changes.changed.map(({ id, text }) => ({ id, text })), [
+    { id: "relabeled", text: "New" },
+    { id: "added", text: undefined },
+  ]);
+  assert.deepEqual(changes.deleted, ["removed"]);
+  assert.equal(changes.element_count, 3);
 });
 
 test("arrows run from edge to edge between boxes", () => {

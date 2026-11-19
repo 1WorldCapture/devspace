@@ -148,6 +148,44 @@ export function summarizeScene(elements: readonly WhiteboardElement[]): Whiteboa
   return summaries;
 }
 
+export interface WhiteboardChanges {
+  /** Visible elements a batch drew or edited, including shapes whose label it changed. */
+  changed: WhiteboardElementSummary[];
+  /** Elements the batch deleted, not counting labels deleted with their shape. */
+  deleted: string[];
+  /** Visible elements on the board afterwards. */
+  element_count: number;
+}
+
+/** Describes only what one batch changed, so drawing in several calls does not resend the whole board. */
+export function summarizeChanges(elements: readonly WhiteboardElement[], changedIds: readonly string[]): WhiteboardChanges {
+  const byId = new Map(elements.map((element) => [element.id, element]));
+  const touched = new Set<string>();
+  const deleted: string[] = [];
+
+  for (const id of changedIds) {
+    const element = byId.get(id);
+
+    if (!element) continue;
+
+    if (element.isDeleted) {
+      if (!element.containerId) deleted.push(id);
+
+      continue;
+    }
+
+    touched.add(element.containerId ?? id);
+  }
+
+  const summaries = summarizeScene(elements);
+
+  return {
+    changed: summaries.filter((summary) => touched.has(summary.id)),
+    deleted,
+    element_count: summaries.length,
+  };
+}
+
 export interface WhiteboardBox {
   x: number;
   y: number;

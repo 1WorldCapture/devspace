@@ -112,6 +112,24 @@ const migrations: Migration[] = [
     name: "workspace-activity",
     up: migrateWorkspaceActivity,
   },
+  {
+    version: 16,
+    name: "whiteboards",
+    up: (sqlite) => sqlite.exec(`
+      create table whiteboards (
+        id text primary key,
+        project_root text,
+        title text not null,
+        elements_json text not null default '[]',
+        files_json text not null default '{}',
+        element_count integer not null default 0,
+        created_at text not null,
+        updated_at text not null,
+        opened_at text not null
+      );
+      create index whiteboards_project_idx on whiteboards(project_root, opened_at);
+    `),
+  },
 ];
 
 export function migrateDatabase(sqlite: SqliteDatabase): void {

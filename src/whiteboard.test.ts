@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -8,6 +11,7 @@ import express from "express";
 import type { ServerConfig } from "./config.js";
 import { unsafeNarrow } from "./unsafe-narrow.js";
 import { registerWhiteboardTools, WHITEBOARD_TOOL_NAMES, WhiteboardManager } from "./whiteboard.js";
+import { WhiteboardStore } from "./whiteboard-store.js";
 import {
   arrowBetween,
   AUTHOR_STROKE_COLORS,
@@ -151,8 +155,16 @@ async function eventStream(url: string, token = TOKEN): Promise<EventReader & { 
   };
 }
 
+function tempStore(t: TestContext): WhiteboardStore {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-whiteboard-"));
+
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+
+  return new WhiteboardStore(stateDir);
+}
+
 async function startDesktop(t: TestContext) {
-  const whiteboard = new WhiteboardManager(TOKEN, { connectTimeoutMs: 2_000, commandTimeoutMs: 2_000 });
+  const whiteboard = new WhiteboardManager(TOKEN, tempStore(t), { connectTimeoutMs: 2_000, commandTimeoutMs: 2_000 });
   const app = express();
   app.use("/desktop", whiteboard.router());
 
@@ -199,8 +211,8 @@ test("the board opens through the app, answers reads from the canvas, and is dis
 
   const session = fragment.get("session")!;
   const canvas = await eventStream(`${base}/whiteboard/api/stream?session=${session}`);
-  assert.deepEqual(await opening, { alreadyOpen: false });
-  assert.deepEqual(await whiteboard.open(), { alreadyOpen: true });
+  assert.equal((await opening).alreadyOpen, false);
+  assert.equal((await whiteboard.open()).alreadyOpen, true);
 
   // A second window for the same board is refused.
   assert.equal((await fetch(`${base}/whiteboard/api/stream?session=${session}`, {
@@ -244,10 +256,99 @@ test("the board opens through the app, answers reads from the canvas, and is dis
   desktop.close();
 });
 
+test("boards are saved per project, resumed on the next open, and kept when a new one starts", async (t) => {
+  const { whiteboard, base } = await startDesktop(t);
+  const desktop = await eventStream(`${base}/events`);
+  t.after(() => desktop.close());
+
+  const auth = { Authorization: `Bearer ${TOKEN}` };
+  const json = async (path: string, init?: RequestInit) => (await fetch(`${base}/whiteboard/api/${path}`, init)).json();
+
+  /** Opens the window as DevSpace.app would and returns its session. */
+  const openWindow = async (request: Parameters<WhiteboardManager["open"]>[0]) => {
+    const opening = whiteboard.open(request);
+    const path: string = JSON.parse(await desktop.next()).path;
+    const session = new URLSearchParams(path.split("#")[1]).get("session")!;
+    const canvas = await eventStream(`${base}/whiteboard/api/stream?session=${session}`);
+
+    return { opened: await opening, session, canvas };
+  };
+
+  const first = await openWindow({ projectRoot: "/repo" });
+  assert.equal(first.opened.board.element_count, 0);
+
+  const sketch = [element("idea"), element("idea-label", { type: "text", text: "Idea", containerId: "idea" }), element("note", { type: "text" })];
+
+  const saved = await fetch(`${base}/whiteboard/api/save`, {
+    method: "POST",
+    headers: { ...auth, "Content-Type": "text/plain" },
+    body: JSON.stringify({ session: first.session, board_id: first.opened.board.id, elements: sketch, files: {} }),
+  });
+
+  assert.equal(saved.status, 204);
+
+  // The global boards are separate from the project's.
+  whiteboard.close();
+  assert.deepEqual(JSON.parse(await desktop.next()), { type: "whiteboard.close" });
+  const global = await openWindow({});
+  assert.notEqual(global.opened.board.id, first.opened.board.id);
+  assert.equal(global.opened.board.project_root, undefined);
+
+  // Reopening the project resumes its board in the open window, with the saved drawing.
+  const load = global.canvas.next().then(async (line) => {
+    const command = JSON.parse(line);
+    await fetch(`${base}/whiteboard/api/result`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "text/plain" },
+      body: JSON.stringify({ session: global.session, request_id: command.request_id, ok: true }),
+    });
+
+    return command;
+  });
+
+  const resumed = await whiteboard.open({ projectRoot: "/repo" });
+  const loadCommand = await load;
+
+  assert.equal(resumed.board.id, first.opened.board.id);
+  // Labels count with their shape.
+  assert.equal(resumed.board.element_count, 2);
+  assert.deepEqual(loadCommand.board.scene.elements.map((saved: { id: string }) => saved.id), ["idea", "idea-label", "note"]);
+  assert.deepEqual((await json(`board?session=${global.session}`, { headers: auth })).board.id, first.opened.board.id);
+
+  // A new board leaves the old one listed after it.
+  whiteboard.close();
+  await desktop.next();
+  const fresh = await openWindow({ projectRoot: "/repo", newBoard: true, title: "Plan B" });
+  assert.equal(fresh.opened.board.title, "Plan B");
+  assert.deepEqual(fresh.opened.boards.map((board) => board.id), [fresh.opened.board.id, first.opened.board.id]);
+
+  // The window's list switches only among the shown board's project.
+  const listed = await json(`boards?session=${fresh.session}`, { headers: auth });
+  assert.deepEqual(listed.boards.map((board: { id: string }) => board.id), [fresh.opened.board.id, first.opened.board.id]);
+
+  const switchTo = (body: { board_id: string }) => fetch(`${base}/whiteboard/api/switch`, {
+    method: "POST",
+    headers: { ...auth, "Content-Type": "application/json" },
+    body: JSON.stringify({ session: fresh.session, ...body }),
+  });
+
+  assert.equal((await switchTo({ board_id: global.opened.board.id })).status, 404);
+
+  const switched = await (await switchTo({ board_id: first.opened.board.id })).json();
+  assert.equal(switched.board.id, first.opened.board.id);
+  assert.equal(switched.scene.elements.length, 3);
+
+  // The board the user switched to is the one the next open resumes.
+  whiteboard.close();
+  await desktop.next();
+  assert.equal((await openWindow({ projectRoot: "/repo" })).opened.board.id, first.opened.board.id);
+});
+
 test("whiteboard tools are listed and report a missing app as a tool error", async (t) => {
   const server = new McpServer({ name: "test", version: "1.0.0" });
-  const whiteboard = new WhiteboardManager(TOKEN);
-  registerWhiteboardTools(server, unsafeNarrow<ServerConfig>({ logging: { toolCalls: false } }), whiteboard);
+  const whiteboard = new WhiteboardManager(TOKEN, tempStore(t));
+  const workspaces = { getWorkspace: () => Promise.reject(new Error("unused")) };
+  registerWhiteboardTools(server, unsafeNarrow<ServerConfig>({ logging: { toolCalls: false } }), whiteboard, workspaces);
 
   const client = new Client({ name: "client", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

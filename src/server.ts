@@ -29,6 +29,7 @@ import {
 } from "./artifact-tools.js";
 import { isScreenCaptureSupportedPlatform, registerScreenCaptureTool } from "./screen-capture.js";
 import { DESKTOP_PATH, DESKTOP_TOKEN_ENV, registerWhiteboardTools, WhiteboardManager } from "./whiteboard.js";
+import { WhiteboardStore } from "./whiteboard-store.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
@@ -935,7 +936,7 @@ function registerMcpSurface(
   }
 
   if (whiteboard) {
-    registerWhiteboardTools(registrationTarget, config, whiteboard);
+    registerWhiteboardTools(registrationTarget, config, whiteboard, workspaces);
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
@@ -1112,7 +1113,7 @@ export function createServer(
   const desktopToken = process.env[DESKTOP_TOKEN_ENV];
 
   const whiteboard = isScreenCaptureSupportedPlatform() && desktopToken
-    ? new WhiteboardManager(desktopToken)
+    ? new WhiteboardManager(desktopToken, new WhiteboardStore(config.stateDir))
     : undefined;
 
   const workspaceActivityJournal = config.activity.enabled

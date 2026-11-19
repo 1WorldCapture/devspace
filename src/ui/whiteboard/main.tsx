@@ -4,17 +4,20 @@ import {
   Excalidraw,
   exportToBlob,
   getCommonBounds,
+  getSceneVersion,
   newElementWith,
   restoreElements,
+  Sidebar,
 } from "@excalidraw/excalidraw";
 import type { ExcalidrawElementSkeleton } from "@excalidraw/excalidraw/data/transform";
 import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
-import type { AppState, ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
+import type { AppState, BinaryFileData, BinaryFiles, ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 import "@excalidraw/excalidraw/index.css";
 import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { unsafeNarrow } from "../../unsafe-narrow.js";
 import type {
+  CanvasBoard,
   CanvasCommand,
   PanDirection,
   WhiteboardAddElement,
@@ -36,6 +39,7 @@ import {
   type WhiteboardBox,
   type WhiteboardElement,
 } from "../../whiteboard-scene.js";
+import type { WhiteboardBoardSummary } from "../../whiteboard-store.js";
 
 declare global {
   interface Window {
@@ -727,6 +731,107 @@ async function boardImage(api: ExcalidrawImperativeAPI): Promise<string | undefi
   return btoa(binary);
 }
 
+/** Quiet time after the last change before the board is saved. */
+const SAVE_DELAY_MS = 500;
+
+/** The board the window shows; saves go to it. */
+let currentBoardId = "";
+
+/** Scene version last saved, so view-only changes do not save. */
+let savedVersion = -1;
+
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Lets the board list follow switches the host makes. */
+let onBoardShown: (board: WhiteboardBoardSummary) => void = () => {};
+
+/** Host commands and the user's board switches, one at a time. */
+let queue = Promise.resolve();
+
+function enqueue(task: () => Promise<void>): Promise<void> {
+  const next = queue.then(task);
+  queue = next.catch(() => undefined);
+
+  return next;
+}
+
+function scheduleSave(api: ExcalidrawImperativeAPI): void {
+  if (getSceneVersion(api.getSceneElementsIncludingDeleted()) === savedVersion) return;
+
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => void saveBoard(api), SAVE_DELAY_MS);
+}
+
+/** Saves the board now if it changed; `keepalive` lets the save outlive a closing page. */
+async function saveBoard(api: ExcalidrawImperativeAPI, keepalive = false): Promise<void> {
+  clearTimeout(saveTimer);
+  saveTimer = undefined;
+
+  const version = getSceneVersion(api.getSceneElementsIncludingDeleted());
+
+  if (version === savedVersion || !currentBoardId) return;
+
+  savedVersion = version;
+
+  // Deleted elements only serve undo, which does not survive a reload.
+  const elements = api.getSceneElements();
+  const fileIds = new Set<string>(elements.flatMap((element: ExcalidrawElement) => element.type === "image" && element.fileId ? [element.fileId] : []));
+  const allFiles = api.getFiles();
+  const files: BinaryFiles = {};
+
+  for (const id of fileIds) {
+    const file = allFiles[id];
+
+    if (file) files[id] = file;
+  }
+
+  await fetch(`${API}/save`, {
+    method: "POST",
+    headers: { Authorization: authorization, "Content-Type": "text/plain" },
+    body: JSON.stringify({ session, board_id: currentBoardId, elements, files }),
+    keepalive,
+  });
+}
+
+/** Replaces the canvas with a saved board, after saving the one it showed. */
+async function showBoard(api: ExcalidrawImperativeAPI, { board, scene }: CanvasBoard): Promise<void> {
+  await saveBoard(api);
+
+  // SAFETY: The scene holds elements this page saved; restoreElements repairs anything older.
+  const elements = restoreElements(unsafeNarrow<ExcalidrawElement[]>(scene.elements), null);
+  const texts = elements.flatMap((element: ExcalidrawElement) => element.type === "text" ? [element.text] : []);
+
+  if (texts.length > 0) await document.fonts.load("20px Excalifont, Xiaolai", texts.join(""));
+
+  currentBoardId = board.id;
+  seenVersions.clear();
+  recordSeen(elements);
+  // SAFETY: The files were saved from Excalidraw's own BinaryFiles map.
+  api.addFiles(unsafeNarrow<BinaryFileData[]>(Object.values(scene.files)));
+  api.updateScene({ elements, captureUpdate: CaptureUpdateAction.NEVER });
+  api.history.clear();
+  savedVersion = getSceneVersion(api.getSceneElementsIncludingDeleted());
+
+  const box = boundsOf(api.getSceneElements());
+
+  if (box) showBox(api, box, 1);
+
+  onBoardShown(board);
+}
+
+async function boardRequest(path: string, init?: RequestInit): Promise<CanvasBoard> {
+  const response = await fetch(`${API}/${path}`, {
+    ...init,
+    headers: { Authorization: authorization, "Content-Type": "application/json" },
+    cache: "no-store",
+  });
+
+  if (!response.ok) throw new Error(`The board could not be opened (${response.status}).`);
+
+  // SAFETY: The token-authenticated server answers board requests with a CanvasBoard.
+  return unsafeNarrow<CanvasBoard>(await response.json());
+}
+
 interface CanvasReply {
   session: string;
   request_id: string;
@@ -742,7 +847,13 @@ async function runCommand(api: ExcalidrawImperativeAPI, command: CanvasCommand):
   const reply: CanvasReply = { session, request_id: command.request_id, ok: true };
 
   try {
-    if (command.kind === "update") reply.changed_ids = await applyOperations(api, command.operations);
+    if (command.kind === "load") await showBoard(api, command.board);
+
+    if (command.kind === "update") {
+      reply.changed_ids = await applyOperations(api, command.operations);
+      // Save what the host drew right away rather than after the quiet time.
+      await saveBoard(api);
+    }
 
     if (command.kind === "view") changeView(api, command.action, command.ids, command.direction);
 
@@ -779,7 +890,6 @@ async function listen(api: ExcalidrawImperativeAPI): Promise<void> {
 
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
-  let queue = Promise.resolve();
 
   for (;;) {
     const { value, done } = await reader.read();
@@ -800,7 +910,7 @@ async function listen(api: ExcalidrawImperativeAPI): Promise<void> {
 
         // SAFETY: The token-authenticated server sends only CanvasCommand events on this stream.
         const command = unsafeNarrow<CanvasCommand>(JSON.parse(line.slice("data: ".length)));
-        queue = queue.then(() => runCommand(api, command));
+        void enqueue(() => runCommand(api, command));
       }
     }
   }
@@ -823,31 +933,124 @@ function Legend() {
   );
 }
 
+const BOARDS_SIDEBAR = "boards";
+
+const listIcon = (
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
+    <path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" />
+  </svg>
+);
+
+const timeFormat = new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
+/**
+ * The saved boards of the shown board's project, or the global boards. The
+ * user switches boards or starts a new one here; the old board stays saved.
+ */
+function BoardList({ api, current }: { api: ExcalidrawImperativeAPI; current: string }) {
+  const [boards, setBoards] = useState<WhiteboardBoardSummary[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void fetch(`${API}/boards?session=${encodeURIComponent(session)}`, { headers: { Authorization: authorization }, cache: "no-store" })
+      .then(async (response) => {
+        // SAFETY: The token-authenticated server answers with its board list.
+        if (response.ok) setBoards(unsafeNarrow<{ boards: WhiteboardBoardSummary[] }>(await response.json()).boards);
+      });
+  }, [current]);
+
+  const open = (body: { board_id: string } | { new: true }) => enqueue(async () => {
+    setError("");
+
+    try {
+      await showBoard(api, await boardRequest("switch", { method: "POST", body: JSON.stringify({ session, ...body }) }));
+      api.toggleSidebar({ name: BOARDS_SIDEBAR, force: false });
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    }
+  });
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: "0 12px 12px", overflowY: "auto" }}>
+      <button type="button" className="devspace-board devspace-board--new" onClick={() => void open({ new: true })}>
+        ＋ 新建白板
+      </button>
+      {boards.map((board) => (
+        <button
+          type="button"
+          key={board.id}
+          className={`devspace-board${board.id === current ? " devspace-board--current" : ""}`}
+          onClick={() => { if (board.id !== current) void open({ board_id: board.id }); }}
+        >
+          <span className="devspace-board__title">{board.title}</span>
+          <span className="devspace-board__meta">{board.element_count} 个元素 · {timeFormat.format(new Date(board.updated_at))}</span>
+        </button>
+      ))}
+      {error && <div style={{ color: "#e03131", fontSize: 12 }}>{error}</div>}
+    </div>
+  );
+}
+
+const BOARD_LIST_CSS = `
+.devspace-board { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: 8px 10px;
+  border: 1px solid transparent; border-radius: 8px; background: none; color: var(--text-primary-color); cursor: pointer;
+  font: 13px system-ui, sans-serif; text-align: left; }
+.devspace-board:hover { background: var(--button-hover-bg, #f1f0ff); }
+.devspace-board--current { border-color: var(--color-primary, #6965db); background: var(--color-primary-light, #e3e2fe); cursor: default; }
+.devspace-board--new { flex-direction: row; justify-content: center; border: 1px dashed var(--default-border-color, #ced4da); }
+.devspace-board__title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.devspace-board__meta { font-size: 11px; color: var(--color-gray-50, #868e96); }
+`;
+
 function App() {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
   const [closed, setClosed] = useState(false);
   const [selecting, setSelecting] = useState(false);
+  const [listing, setListing] = useState(false);
+  const [board, setBoard] = useState<WhiteboardBoardSummary | null>(null);
 
   useEffect(() => {
     if (!api) return;
 
-    void listen(api).catch(() => undefined).finally(() => setClosed(true));
+    onBoardShown = setBoard;
+
+    const flush = () => void saveBoard(api, true);
+    window.addEventListener("pagehide", flush);
+
+    // Show the saved board before taking the host's commands.
+    void enqueue(async () => showBoard(api, await boardRequest(`board?session=${encodeURIComponent(session)}`)))
+      .then(() => listen(api))
+      .catch(() => undefined)
+      .finally(() => setClosed(true));
+
+    return () => window.removeEventListener("pagehide", flush);
   }, [api]);
 
   return (
     <>
+      <style>{BOARD_LIST_CSS}</style>
       <Excalidraw
         excalidrawAPI={setApi}
         langCode="zh-CN"
         initialData={{ appState: { currentItemStrokeColor: AUTHOR_STROKE_COLORS.user } }}
         onChange={(elements: readonly ExcalidrawElement[], appState: AppState) => {
           setSelecting(Object.keys(appState.selectedElementIds).length > 0);
+          setListing(appState.openSidebar?.name === BOARDS_SIDEBAR);
 
-          if (api) handleChange(api, elements, appState);
+          if (!api) return;
+
+          handleChange(api, elements, appState);
+          scheduleSave(api);
         }}
+        renderTopRightUI={() => <Sidebar.Trigger name={BOARDS_SIDEBAR} icon={listIcon} title={board ? `白板列表 · ${board.title}` : "白板列表"} />}
         UIOptions={{ canvasActions: { loadScene: false, saveToActiveFile: false, export: false, saveAsImage: false } }}
-      />
-      {!selecting && <Legend />}
+      >
+        <Sidebar name={BOARDS_SIDEBAR}>
+          <Sidebar.Header>{board?.title ?? "白板"}</Sidebar.Header>
+          {api && board && <BoardList api={api} current={board.id} />}
+        </Sidebar>
+      </Excalidraw>
+      {!selecting && !listing && <Legend />}
       {closed && (
         <div style={{
           position: "fixed", inset: 0, display: "grid", placeItems: "center",

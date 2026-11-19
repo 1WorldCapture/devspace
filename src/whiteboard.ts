@@ -7,7 +7,9 @@ import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
 import { logToolCall, textBlock } from "./tool-surfaces/shared.js";
 import type { ToolContent } from "./tool-surfaces/types.js";
+import type { WorkspaceRegistry } from "./workspaces.js";
 import { summarizeChanges, summarizeScene, type WhiteboardChanges } from "./whiteboard-scene.js";
+import { whiteboardFileSchema, type WhiteboardBoardSummary, type WhiteboardScene, type WhiteboardStore } from "./whiteboard-store.js";
 
 /**
  * The desktop whiteboard: a floating Excalidraw window that DevSpace.app shows
@@ -20,8 +22,10 @@ import { summarizeChanges, summarizeScene, type WhiteboardChanges } from "./whit
  * through the user's tunnel also arrive from loopback, so the token, not the
  * peer address, is what keeps these routes local to the app.
  *
- * There is at most one whiteboard. Closing it, from a tool or the window's
- * close button, discards its contents.
+ * There is at most one whiteboard window, showing one saved board at a time.
+ * The page saves the board as it changes, so closing the window keeps it, and
+ * the next open resumes the most recently opened board of the same project,
+ * or of the global boards outside any project.
  */
 export const DESKTOP_PATH = "/desktop";
 export const DESKTOP_TOKEN_ENV = "DEVSPACE_DESKTOP_TOKEN";
@@ -83,8 +87,15 @@ export type WhiteboardAddElement = z.infer<typeof addElementSchema>;
 
 export type WhiteboardOperation = z.infer<typeof whiteboardOperationSchema>;
 
+/** A board the canvas page shows, with its saved contents. */
+export interface CanvasBoard {
+  board: WhiteboardBoardSummary;
+  scene: WhiteboardScene;
+}
+
 /** A command the canvas page carries out and answers on `/api/result`. */
 export type CanvasCommand =
+  | { request_id: string; kind: "load"; board: CanvasBoard }
   | { request_id: string; kind: "update"; operations: WhiteboardOperation[] }
   | { request_id: string; kind: "read"; include_image: boolean }
   | { request_id: string; kind: "view"; action: WhiteboardViewAction; ids?: string[]; direction?: PanDirection };
@@ -127,6 +138,18 @@ const canvasResultSchema = z.object({
 
 type CanvasResult = z.infer<typeof canvasResultSchema>;
 
+const saveSchema = z.object({
+  session: z.string(),
+  board_id: z.string(),
+  elements: z.array(z.unknown()),
+  files: z.record(z.string(), whiteboardFileSchema),
+});
+
+const switchSchema = z.union([
+  z.object({ session: z.string(), board_id: z.string() }),
+  z.object({ session: z.string(), new: z.literal(true) }),
+]);
+
 export class WhiteboardError extends Error {}
 
 interface PendingCommand {
@@ -137,6 +160,8 @@ interface PendingCommand {
 
 interface WhiteboardSession {
   id: string;
+  /** The board the window shows. */
+  boardId: string;
   canvas?: Response;
   connected: Promise<void>;
   markConnected: () => void;
@@ -152,7 +177,33 @@ export interface WhiteboardManagerOptions {
 
 export type WhiteboardView = NonNullable<CanvasResult["view"]>;
 
+/** Which board to open: by default the most recently opened board of the project, or of the global boards. */
+export interface WhiteboardOpenRequest {
+  /** Project root whose boards to use; absent for the global boards. */
+  projectRoot?: string;
+  /** Start a new empty board instead of resuming one. */
+  newBoard?: boolean;
+  /** Title of a new board. */
+  title?: string;
+  /** Open this saved board. */
+  boardId?: string;
+}
+
+export interface WhiteboardOpened {
+  alreadyOpen: boolean;
+  board: WhiteboardBoardSummary;
+  /** Boards of the same project, or the global boards, most recently opened first. */
+  boards: WhiteboardBoardSummary[];
+}
+
+/** The board a result describes. */
+export interface WhiteboardBoardRef {
+  id: string;
+  title: string;
+}
+
 export interface WhiteboardSnapshot {
+  board?: WhiteboardBoardRef;
   elements: ReturnType<typeof summarizeScene>;
   /** What the window shows: zoom, the board area visible between the toolbars, and the window size. */
   view?: WhiteboardView;
@@ -161,6 +212,7 @@ export interface WhiteboardSnapshot {
 
 /** What one whiteboard_update changed, and what the window shows afterwards. */
 export interface WhiteboardUpdate extends WhiteboardChanges {
+  board?: WhiteboardBoardRef;
   view?: WhiteboardView;
 }
 
@@ -172,7 +224,7 @@ export class WhiteboardManager {
   private readonly commandTimeoutMs: number;
   private readonly buildDirectory: string;
 
-  constructor(private readonly token: string, options: WhiteboardManagerOptions = {}) {
+  constructor(private readonly token: string, private readonly store: WhiteboardStore, options: WhiteboardManagerOptions = {}) {
     this.tokenDigest = digest(token);
     this.connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
@@ -184,19 +236,39 @@ export class WhiteboardManager {
     return this.session?.canvas !== undefined;
   }
 
-  /** Opens the whiteboard window, or returns at once when it is already open. */
-  async open(): Promise<{ alreadyOpen: boolean }> {
-    if (this.session?.canvas) return { alreadyOpen: true };
+  /**
+   * Shows the requested board, opening the window when it is closed. An open
+   * window switches to the board; one already showing it is left alone.
+   */
+  async open(request: WhiteboardOpenRequest = {}): Promise<WhiteboardOpened> {
+    if (!this.session && this.desktopClients.size === 0) {
+      throw new WhiteboardError(
+        "DevSpace.app is not connected. The whiteboard needs the DevSpace menu bar app running on the user's Mac.",
+      );
+    }
+
+    const board = this.store.markOpened(this.chooseBoard(request).id);
+
+    const opened = (alreadyOpen: boolean): WhiteboardOpened => ({
+      alreadyOpen,
+      board,
+      boards: this.store.list(board.project_root),
+    });
+
+    if (this.session?.canvas) {
+      if (this.session.boardId === board.id) return opened(true);
+
+      await this.command({ request_id: randomUUID(), kind: "load", board: { board, scene: this.store.scene(board.id) } });
+      this.session.boardId = board.id;
+
+      return opened(false);
+    }
 
     if (!this.session) {
-      if (this.desktopClients.size === 0) {
-        throw new WhiteboardError(
-          "DevSpace.app is not connected. The whiteboard needs the DevSpace menu bar app running on the user's Mac.",
-        );
-      }
-
-      this.session = createSession();
+      this.session = createSession(board.id);
       this.broadcast({ type: "whiteboard.open", path: `${DESKTOP_PATH}/whiteboard/#session=${this.session.id}&token=${this.token}` });
+    } else {
+      this.session.boardId = board.id;
     }
 
     const session = this.session;
@@ -216,12 +288,15 @@ export class WhiteboardManager {
       clearTimeout(timer);
     }
 
-    return { alreadyOpen: false };
+    return opened(false);
   }
 
   async update(operations: WhiteboardOperation[]): Promise<WhiteboardUpdate> {
     const result = await this.command({ request_id: randomUUID(), kind: "update", operations });
     const value: WhiteboardUpdate = summarizeChanges(result.elements ?? [], result.changed_ids ?? []);
+    const board = this.boardRef();
+
+    if (board) value.board = board;
 
     if (result.view) value.view = result.view;
 
@@ -229,7 +304,10 @@ export class WhiteboardManager {
   }
 
   async read(includeImage: boolean): Promise<WhiteboardSnapshot> {
-    return snapshot(await this.command({ request_id: randomUUID(), kind: "read", include_image: includeImage }));
+    const value = snapshot(await this.command({ request_id: randomUUID(), kind: "read", include_image: includeImage }));
+    const board = this.boardRef();
+
+    return board ? { board, ...value } : value;
   }
 
   /** Moves the window's view, then captures what the window shows. */
@@ -243,7 +321,7 @@ export class WhiteboardManager {
     return snapshot(await this.command(command));
   }
 
-  /** Closes the window and discards the board. Returns false when nothing was open. */
+  /** Closes the window; the board stays saved. Returns false when nothing was open. */
   close(): boolean {
     if (!this.session) return false;
 
@@ -252,12 +330,14 @@ export class WhiteboardManager {
     return true;
   }
 
+  /** Closes the window and the desktop streams, then the board store, which the manager owns. */
   shutdown(): void {
     this.destroy("DevSpace is shutting down.");
 
     for (const client of this.desktopClients) client.end();
 
     this.desktopClients.clear();
+    this.store.close();
   }
 
   router(): Router {
@@ -299,6 +379,68 @@ export class WhiteboardManager {
       });
     });
 
+    router.get("/whiteboard/api/board", requireToken, (req, res) => {
+      const session = this.sessionFor(querySession(req), res);
+
+      if (session) res.json(this.canvasBoard(session.boardId));
+    });
+
+    router.get("/whiteboard/api/boards", requireToken, (req, res) => {
+      const session = this.sessionFor(querySession(req), res);
+
+      if (session) res.json({ current: session.boardId, boards: this.store.list(this.store.get(session.boardId)?.project_root) });
+    });
+
+    // The user picks another board, or starts one, from the window's board list.
+    router.post("/whiteboard/api/switch", requireToken, express.json(), (req, res) => {
+      const parsed = switchSchema.safeParse(req.body);
+      const session = parsed.success ? this.sessionFor(parsed.data.session, res) : undefined;
+
+      if (!parsed.success) res.status(400).json({ error: "Invalid request." });
+
+      if (!parsed.success || !session) return;
+
+      const projectRoot = this.store.get(session.boardId)?.project_root;
+      const target = "board_id" in parsed.data ? this.store.get(parsed.data.board_id) : this.store.create(projectRoot);
+
+      if (!target || target.project_root !== projectRoot) {
+        res.status(404).json({ error: "No such board." });
+
+        return;
+      }
+
+      this.store.markOpened(target.id);
+      session.boardId = target.id;
+      res.json(this.canvasBoard(target.id));
+    });
+
+    router.post(
+      "/whiteboard/api/save",
+      requireToken,
+      express.text({ type: "text/plain", limit: RESULT_BODY_LIMIT }),
+      (req, res) => {
+        let save: z.infer<typeof saveSchema>;
+
+        try {
+          save = saveSchema.parse(JSON.parse(String(req.body)));
+        } catch {
+          res.status(400).json({ error: "Invalid board." });
+
+          return;
+        }
+
+        if (save.session !== this.session?.id) {
+          res.status(404).json({ error: "This whiteboard is no longer open." });
+
+          return;
+        }
+
+        const saved = this.store.save(save.board_id, { elements: save.elements, files: save.files });
+
+        res.status(saved ? 204 : 404).end();
+      },
+    );
+
     router.post(
       "/whiteboard/api/result",
       requireToken,
@@ -336,6 +478,47 @@ export class WhiteboardManager {
     router.use("/whiteboard", express.static(this.buildDirectory, { fallthrough: false }));
 
     return router;
+  }
+
+  private chooseBoard(request: WhiteboardOpenRequest): WhiteboardBoardSummary {
+    if (request.boardId) {
+      const board = this.store.get(request.boardId);
+
+      if (!board) throw new WhiteboardError(`No whiteboard with id "${request.boardId}".`);
+
+      return board;
+    }
+
+    if (!request.newBoard) {
+      const latest = this.store.list(request.projectRoot)[0];
+
+      if (latest) return latest;
+    }
+
+    return this.store.create(request.projectRoot, request.title);
+  }
+
+  private canvasBoard(boardId: string): CanvasBoard {
+    const board = this.store.get(boardId);
+
+    if (!board) throw new WhiteboardError(`No whiteboard with id "${boardId}".`);
+
+    return { board, scene: this.store.scene(boardId) };
+  }
+
+  private boardRef(): WhiteboardBoardRef | undefined {
+    const board = this.session ? this.store.get(this.session.boardId) : undefined;
+
+    return board ? { id: board.id, title: board.title } : undefined;
+  }
+
+  /** The open session a canvas request names, or undefined after answering 404. */
+  private sessionFor(id: string | undefined, res: Response): WhiteboardSession | undefined {
+    if (this.session && id === this.session.id) return this.session;
+
+    res.status(404).json({ error: "This whiteboard is no longer open." });
+
+    return undefined;
   }
 
   private requireToken(req: Request, res: Response, next: NextFunction): void {
@@ -400,11 +583,15 @@ type WhiteboardDesktopEvent =
   | { type: "whiteboard.open"; path: string }
   | { type: "whiteboard.close" };
 
-function createSession(): WhiteboardSession {
+function querySession(req: Request): string | undefined {
+  return z.string().optional().catch(undefined).parse(req.query.session);
+}
+
+function createSession(boardId: string): WhiteboardSession {
   let markConnected = () => {};
   const connected = new Promise<void>((resolve) => { markConnected = resolve; });
 
-  return { id: randomUUID(), connected, markConnected, pending: new Map() };
+  return { id: randomUUID(), boardId, connected, markConnected, pending: new Map() };
 }
 
 function snapshot(result: CanvasResult): WhiteboardSnapshot {
@@ -446,6 +633,7 @@ export function registerWhiteboardTools(
   server: Pick<McpServer, "registerTool">,
   config: ServerConfig,
   whiteboard: WhiteboardManager,
+  workspaces: Pick<WorkspaceRegistry, "getWorkspace">,
 ): void {
   const annotations = { destructiveHint: false, openWorldHint: false };
 
@@ -455,14 +643,52 @@ export function registerWhiteboardTools(
       title: "Open whiteboard",
       description:
         "Open a shared Excalidraw whiteboard in a small floating window on the user's Mac, for sketching ideas while talking. "
-        + "Both you and the user can draw on it. Does nothing if it is already open. Not tied to any workspace.",
-      inputSchema: {},
-      annotations: { ...annotations, readOnlyHint: false, idempotentHint: true },
+        + "Both you and the user can draw on it, and it is saved as it changes. "
+        + "With workspace_id it opens that project's most recent board, which may already hold earlier drawings; "
+        + "without it, the most recent global board. Set new only when the user wants a fresh board; "
+        + "the previous one is kept and listed. An open window switches to the requested board. "
+        + "Returns the board shown and the other saved boards of the same project (or the global ones); "
+        + "pass board_id to reopen one of them, and call whiteboard_read before drawing on a board that has elements.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Project whose boards to use. Omit for the global boards."),
+        new: z.boolean().optional().describe("Start a new empty board instead of resuming the most recent one."),
+        title: z.string().min(1).optional().describe("new only: a short title for the new board."),
+        board_id: z.string().min(1).optional().describe("Reopen this saved board, from a previous result's boards."),
+      },
+      annotations: { ...annotations, readOnlyHint: false, idempotentHint: false },
     },
-    () => runWhiteboardTool(config, "whiteboard_open", async () => {
-      const { alreadyOpen } = await whiteboard.open();
+    ({ workspace_id: workspaceId, new: newBoard, title, board_id: boardId }) => runWhiteboardTool(config, "whiteboard_open", async () => {
+      if (title !== undefined && !newBoard) throw new WhiteboardError("title needs new.");
 
-      return [textBlock(alreadyOpen ? "The whiteboard is already open." : "The whiteboard is open on the user's screen.")];
+      if (boardId !== undefined && newBoard) throw new WhiteboardError("Pass either board_id or new, not both.");
+
+      const request: WhiteboardOpenRequest = {};
+
+      if (workspaceId) {
+        const workspace = await workspaces.getWorkspace(workspaceId);
+        // Worktrees share their source project's boards.
+        request.projectRoot = workspace.sourceRoot ?? workspace.canonicalRoot;
+      }
+
+      if (newBoard) request.newBoard = true;
+
+      if (title !== undefined) request.title = title;
+
+      if (boardId !== undefined) request.boardId = boardId;
+
+      const { alreadyOpen, board, boards } = await whiteboard.open(request);
+
+      const status = alreadyOpen
+        ? "The whiteboard already shows this board."
+        : board.element_count > 0
+          ? "The whiteboard shows this saved board with its earlier drawings."
+          : "The whiteboard shows this empty board.";
+
+      return [textBlock(JSON.stringify({
+        status,
+        board: boardListing(board),
+        boards: boards.filter((other) => other.id !== board.id).map(boardListing),
+      }))];
     }),
   );
 
@@ -547,14 +773,19 @@ export function registerWhiteboardTools(
     "whiteboard_close",
     {
       title: "Close whiteboard",
-      description: "Close the whiteboard window. Its contents are discarded.",
+      description: "Close the whiteboard window. The board stays saved, and the next whiteboard_open resumes it.",
       inputSchema: {},
       annotations: { ...annotations, readOnlyHint: false, idempotentHint: true, destructiveHint: true },
     },
     () => runWhiteboardTool(config, "whiteboard_close", async () => [
-      textBlock(whiteboard.close() ? "The whiteboard is closed and its contents were discarded." : "No whiteboard was open."),
+      textBlock(whiteboard.close() ? "The whiteboard is closed; its board stays saved." : "No whiteboard was open."),
     ]),
   );
+}
+
+/** A board as the host sees it; the project is implied by the request. */
+function boardListing(board: WhiteboardBoardSummary) {
+  return { id: board.id, title: board.title, element_count: board.element_count, updated_at: board.updated_at };
 }
 
 async function runWhiteboardTool(
